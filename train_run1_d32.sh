@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# 标准 d24 模型预训练脚本
-# 适用于 8xH100 GPU 节点
-# 使用方法: bash train_d24.sh
+# Run 1 配置的 d32 预训练脚本
+# 基于 Run 1 (d24) 的配置，只改变 depth=32
+# 用于研究不同深度模型的性能对比
+# Commit: 348fbb3 (Jan 29 2026)
 
 source /home/azanette/.bashrc
 source /home/azanette/miniconda3/etc/profile.d/conda.sh
@@ -14,13 +15,16 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
+# 生成时间戳（格式: YYYYMMDD_HHMMSS）
+CURRENT_TIME=$(date +"%Y%m%d_%H%M%S")
+
 # -----------------------------------------------------------------------------
 # Wandb 配置
-# 设置 wandb project name
 export WANDB_PROJECT="nanochat_d24_guanning"
-WANDB_RUN="pretrain"
+if [ -z "$WANDB_RUN" ]; then
+    WANDB_RUN="d32_pretrain_${CURRENT_TIME}"
+fi
 
-# 显示 wandb 配置信息
 echo "=========================================="
 echo "Wandb 配置"
 echo "=========================================="
@@ -31,30 +35,33 @@ echo "  - 状态: Wandb 记录已启用"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 3. 数据下载和 Tokenizer 训练
+# 数据下载和 Tokenizer 训练
 
 echo "=========================================="
-echo "步骤 3/5: 下载数据并训练 Tokenizer"
+echo "步骤 1/3: 下载数据并训练 Tokenizer"
 echo "=========================================="
 
-# 初始化报告目录
 python -m nanochat.report reset
 
 # 下载前 8 个数据 shards (~2B 字符) 用于训练 tokenizer
-# 每个 shard 约 250M 字符，约 100MB (压缩后)
 echo "正在下载前 8 个数据 shards (用于 tokenizer 训练)..."
 python -m nanochat.dataset -n 8
 
 # 后台下载更多数据 shards (约 370 个 shards，用于预训练)
-# 总共需要约 10B tokens 的数据
-# 注意: 实际需要的 shards 数量取决于你的训练配置
 echo "正在后台下载预训练数据 (370 shards)..."
 python -m nanochat.dataset -n 370 &
 DATASET_DOWNLOAD_PID=$!
 
 # 训练 tokenizer (vocab size = 32768)
-echo "正在训练 tokenizer (vocab_size=32768)..."
-python -m scripts.tok_train
+# 如果 tokenizer 已存在，跳过训练以保持一致性
+TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer"
+if [ -f "$TOKENIZER_DIR/tokenizer.pkl" ] && [ -f "$TOKENIZER_DIR/token_bytes.pt" ]; then
+    echo "Tokenizer 已存在，跳过训练 (使用: $TOKENIZER_DIR)"
+    echo "如需重新训练，请删除该目录: rm -rf $TOKENIZER_DIR"
+else
+    echo "正在训练 tokenizer (vocab_size=32768)..."
+    python -m scripts.tok_train
+fi
 
 # 评估 tokenizer
 echo "正在评估 tokenizer..."
@@ -64,10 +71,10 @@ echo "✓ Tokenizer 训练完成"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 4. 等待数据下载完成
+# 等待数据下载完成
 
 echo "=========================================="
-echo "步骤 4/5: 等待数据下载完成"
+echo "步骤 2/3: 等待数据下载完成"
 echo "=========================================="
 
 echo "等待数据下载完成 (PID: $DATASET_DOWNLOAD_PID)..."
@@ -76,47 +83,43 @@ echo "✓ 数据下载完成"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 5. d24 模型预训练
+# Run 1 配置的 d32 预训练
+# 配置: depth=32, target-param-data-ratio=40, device-batch-size=8
+# core-metric-every=3000 (每 3000 步评估一次 CORE)
+# 注意: ratio=24 表示训练步数翻倍，device-batch-size=8 是 d32 的特性
 
 echo "=========================================="
-echo "步骤 5/5: d24 模型预训练"
+echo "步骤 3/3: Run 1 配置的 d32 预训练"
 echo "=========================================="
 
-echo "开始训练 d24 模型..."
+echo "开始训练 d32 模型 (Run 1 配置，训练步数翻倍)..."
 echo "配置:"
-echo "  - depth: 24"
-echo "  - target-param-data-ratio: 10.5 (compute optimal)"
-echo "  - device-batch-size: 32 (如果 OOM，会自动降级到 16)"
-echo "  - fp8: 启用 (H100 支持)"
+echo "  - depth: 32"
+echo "  - target-param-data-ratio: 24 (训练步数翻倍)"
+echo "  - device-batch-size: 8 (d32 模型更大，使用较小 batch size)"
+echo "  - fp8: 未启用 (使用 bf16)"
+echo "  - core-metric-every: 3000 (每 3000 步评估)"
+echo "  - save-every: 3000 (每 3000 步保存 checkpoint)"
 echo "  - wandb run: $WANDB_RUN"
 echo ""
 
-# d24 预训练命令
-# 使用 compute optimal 的 target-param-data-ratio=10.5 (默认值)
-# 如果 GPU 内存不足，device-batch-size 会自动通过梯度累积调整
-# 评估优化参数：
-#   - sample-every=-1: 关闭定期采样，节省时间
-#   - save-every=-1: 只在最后保存 checkpoint，节省时间和磁盘
-#   - core-metric-every=999999: 只在最后评估 CORE metric（评估很耗时）
-#   - core-metric-max-per-task=-1: 运行完整的 CORE 评估
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=24 \
-    --target-param-data-ratio=10.5 \
-    --device-batch-size=32 \
-    --fp8 \
+    --depth=32 \
+    --target-param-data-ratio=40 \
+    --device-batch-size=8 \
     --run=$WANDB_RUN \
-    --model-tag="d24" \
+    --model-tag="d32_pretrain_${CURRENT_TIME}" \
     --sample-every=-1 \
-    --save-every=-1 \
-    --core-metric-every=999999 \
+    --save-every=3000 \
+    --core-metric-every=3000 \
     --core-metric-max-per-task=-1
 
 echo ""
-echo "✓ 预训练完成！"
+echo "✓ Run 1 配置的 d32 预训练完成！"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 6. 模型评估
+# 模型评估
 
 echo "=========================================="
 echo "评估模型性能"
@@ -124,14 +127,14 @@ echo "=========================================="
 
 echo "正在评估模型 (CORE metric, BPB, samples)..."
 torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- \
-    --device-batch-size=32
+    --device-batch-size=8
 
 echo ""
 echo "✓ 评估完成！"
 echo ""
 
 # -----------------------------------------------------------------------------
-# 7. 生成报告
+# 生成报告
 
 echo "=========================================="
 echo "生成训练报告"
@@ -141,14 +144,22 @@ python -m nanochat.report generate
 
 echo ""
 echo "=========================================="
-echo "训练流程全部完成！"
+echo "Run 1 配置的 d32 预训练完成！"
 echo "=========================================="
 echo ""
-echo "模型 checkpoint 位置: $NANOCHAT_BASE_DIR/models/d24/"
+echo "预期结果 (训练步数翻倍):"
+echo "  - CORE score: 预期会有所提升（更多训练数据）"
+echo "  - Validation BPB: 预期会降低（更多训练）"
+echo "  - Total training time: 约翻倍（d32 模型更大，训练时间更长）"
+echo "  - Steps: 约翻倍（取决于 target-param-data-ratio=40）"
+echo ""
+echo "模型 checkpoint 位置: $NANOCHAT_BASE_DIR/base_checkpoints/d32_pretrain_${CURRENT_TIME}/"
 echo "训练报告: $NANOCHAT_BASE_DIR/report/report.md"
 echo ""
-echo "下一步:"
-echo "  1. 查看训练报告: cat $NANOCHAT_BASE_DIR/report/report.md"
-echo "  2. 如需继续 SFT，运行: bash train_d24_sft.sh"
-echo "  3. 或在 Python 中加载模型进行推理"
+echo "对比说明:"
+echo "  - 此脚本与 train_run1_d24.sh 的主要区别："
+echo "    * depth=32 (vs d24)"
+echo "    * device-batch-size=8 (vs 16，因为 d32 模型更大)"
+echo "  - 其他参数保持一致（target-param-data-ratio=40，训练步数翻倍）"
+echo "  - 可用于研究不同深度模型的性能差异"
 echo ""

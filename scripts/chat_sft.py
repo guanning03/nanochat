@@ -41,8 +41,9 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
 # Model loading
 parser.add_argument("--source", type=str, default="mid", help="base|mid - which checkpoint to load from")
-parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
+parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from (for loading checkpoint)")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--output-model-tag", type=str, default=None, help="model tag for saving SFT checkpoint (defaults to model-tag if not set)")
 # Training horizon
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs")
 parser.add_argument("--num-iterations", type=int, default=-1, help="override number of iterations (-1 = use num_epochs)")
@@ -60,6 +61,10 @@ parser.add_argument("--eval-every", type=int, default=100, help="evaluate val lo
 parser.add_argument("--eval-steps", type=int, default=100, help="number of batches for val loss evaluation")
 parser.add_argument("--eval-metrics-every", type=int, default=200, help="evaluate accuracy metrics every N steps")
 parser.add_argument("--eval-metrics-max-problems", type=int, default=1024, help="max problems per metric evaluation")
+# Checkpointing
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = only at end)")
+# Output
+parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -170,7 +175,15 @@ def get_lr_multiplier(it):
     return lrm
 
 # Go!
-step = 0
+val_loss = None
+metrics = {}
+base_dir = get_base_dir()
+depth = model.config.n_layer
+# Use output_model_tag if specified, otherwise use model_tag, otherwise default to d{depth}
+output_dirname = args.output_model_tag if args.output_model_tag else (args.model_tag if args.model_tag else f"d{depth}") # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
@@ -211,6 +224,31 @@ for step in range(num_iterations):
         })
         model.train()
 
+    # save checkpoint: at the end of the run, or every save_every steps (if enabled)
+    # If save_every == -1, only save at the end. If save_every > 0, save when step % save_every == 0
+    # If save_every == eval_every, save at every eval (recommended)
+    should_save = False
+    if last_step:
+        should_save = True
+    elif args.save_every > 0 and step > 0 and step % args.save_every == 0:
+        should_save = True
+    
+    if master_process and should_save and not args.dry_run:
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(),
+            None, # note: we don't bother to save the optimizer state
+            {
+                "step": step,
+                "val_loss": val_loss if val_loss is not None else None,
+                **metrics,
+                "model_config": model_config_kwargs,
+                "user_config": user_config,
+            }
+        )
+        print0(f"✓ Saved checkpoint to {checkpoint_dir} at step {step}")
+
     if last_step:
         break
 
@@ -246,28 +284,10 @@ for step in range(num_iterations):
         "train_loss": train_loss_item,
         "num_tokens": num_tokens_item,
     })
-    step += 1
+    # Note: step is automatically incremented by the for loop
 
-# Save the model at the end of the run
-if master_process:
-    base_dir = get_base_dir()
-    depth = model.config.n_layer
-    output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
-    save_checkpoint(
-        checkpoint_dir,
-        step,
-        model.state_dict(),
-        None, # note: we don't bother to save the optimizer state
-        {
-            "step": step,
-            "val_loss": val_loss,
-            **metrics,
-            "model_config": model_config_kwargs,
-        }
-    )
-    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+# Note: Checkpoint saving is handled in the training loop above
+# (at last_step or when save_every > 0 and step % save_every == 0)
 
 # Log to report
 from nanochat.report import get_report

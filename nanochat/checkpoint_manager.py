@@ -156,6 +156,9 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
         # guess the step by defaulting to the last step
         step = find_last_step(checkpoint_dir)
     assert step is not None, f"No checkpoints found in {checkpoint_dir}"
+    # Convert step to int if it's a string (e.g., from command line args)
+    if isinstance(step, str):
+        step = int(step)
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)

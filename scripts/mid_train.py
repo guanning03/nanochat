@@ -39,8 +39,9 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
 # Model loading
-parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
+parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from (BASE checkpoint)")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--output-model-tag", type=str, default=None, help="model tag for saving MID checkpoint (defaults to model-tag if not set)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes
@@ -56,6 +57,8 @@ parser.add_argument("--init-lr-frac", type=float, default=1.0, help="initial LR 
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
+# Checkpointing
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
@@ -281,9 +284,16 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step and not args.dry_run:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+    # save checkpoint: at the end of the run, or every save_every steps (if enabled)
+    should_save = False
+    if last_step:
+        should_save = True
+    elif args.save_every > 0 and step > 0 and step % args.save_every == 0:
+        should_save = True
+    
+    if master_process and should_save and not args.dry_run:
+        # Use output_model_tag if specified, otherwise use model_tag, otherwise default to d{depth}
+        output_dirname = args.output_model_tag if args.output_model_tag else (args.model_tag if args.model_tag else f"d{depth}")
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -292,7 +302,7 @@ while True:
             optimizer.state_dict(),
             {
                 "step": step,
-                "val_bpb": val_bpb, # loss at last step
+                "val_bpb": val_bpb if val_bpb is not None else None, # loss at last step
                 "model_config": {
                     "sequence_len": args.max_seq_len,
                     "vocab_size": tokenizer.get_vocab_size(),
